@@ -1,0 +1,9 @@
+.idea/**
+.vscode/**
+.vstags
+data/config.json
+data/*_db
+aleesa-phrases-go
+seed-fortune
+seed-friday
+seed-proverb

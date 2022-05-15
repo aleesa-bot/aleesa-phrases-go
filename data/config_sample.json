@@ -1,0 +1,25 @@
+{
+# Redis server host - localhost if not set
+"server" : "redis",
+
+# Redis server port - 6379 if not set
+"port": 6379,
+
+# Log verbosity - info if not set
+"loglevel": "info",
+
+# Log file location - if not set defaults to stdout
+"log": "/var/log/aleesa-phrase-go/aleesa-phrases-go.log",
+
+# Must be set to redis pubsub channel where chat client daemons sending messages
+"channel": "phrases",
+
+# path to directory that contains various data files
+"data_dir": "data",
+
+# Must be set - it is default command prefix (it is also set for each chat client daemon)
+"csign": "!",
+
+# Will be set to 5 if not set
+"forwards_max": 5
+}
