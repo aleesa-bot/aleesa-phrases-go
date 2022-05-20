@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"math"
+	"math/rand"
 	"os"
 	"os/signal"
 	"strconv"
@@ -551,6 +552,10 @@ func init() {
 		FullTimestamp:          true,
 		TimestampFormat:        "2006-01-02 15:04:05",
 	})
+
+	// Запустим наш рандомайзер
+	rngSeed := rand.NewSource(time.Now().UnixNano())
+	random = rand.New(rngSeed)
 
 	config = ReadConfig()
 

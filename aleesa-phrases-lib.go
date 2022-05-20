@@ -95,6 +95,9 @@ var pebbleDB struct {
 	}
 }
 
+// Создадим источник рандома
+var random *rand.Rand
+
 // ReadConfig читает и валидирует конфиг, а также выставляет некоторые default-ы, если значений для параметров в конфиге нет
 func ReadConfig() MyConfig {
 	configLoaded := false
@@ -307,7 +310,7 @@ func FetchRandomV(db *pebble.DB, dbName string) (string, error) {
 		return answer, fmt.Errorf("garbage in count_db while getting info about %s: %s", dbName, err)
 	}
 
-	phraseNum := 1 + rand.Intn(amountNum)
+	phraseNum := random.Intn(amountNum + 1)
 	phraseItem := fmt.Sprintf("%d", phraseNum)
 
 	answer, err = FetchV(db, phraseItem)
