@@ -371,29 +371,53 @@ func msgParser(ctx context.Context, msg string) {
 	msgLen := len(j.Message)
 
 	if j.Message[0:len(j.Misc.CSign)] == j.Misc.CSign { //nolint:gocritic
-		var cmd = j.Message[len(j.Misc.CSign):]
+		switch cmd := j.Message[len(j.Misc.CSign):]; {
+		case cmd == "friday" || cmd == "пятница":
+			j.Message = friday()
 
-		switch cmd {
-		case "friday":
-			j.Message = friday()
-		case "пятница":
-			j.Message = friday()
-		case "proverb":
+		case cmd == "proverb" || cmd == "пословица":
 			j.Message = proverb()
-		case "пословица":
-			j.Message = proverb()
-		case "f":
+
+		case cmd == "f" || cmd == "ф":
 			j.Message = fortune()
-		case "ф":
+
+		case cmd == "fortune" || cmd == "фортунка":
 			j.Message = fortune()
-		case "fortune":
-			j.Message = fortune()
-		case "фортунка":
-			j.Message = fortune()
-		case "karma":
+
+		case cmd == "karma" || cmd == "карма":
 			j.Message = getKarma(j.ChatID, "")
-		case "карма":
-			j.Message = getKarma(j.ChatID, "")
+
+		case cmd[:3] == "rum" || cmd[:3] == "ром":
+			format := "/me притаскивает на подносе стопку рома для %s, края стопки искрятся кристаллами соли."
+			j.Message = fmt.Sprintf(format, j.Misc.Username)
+
+		case cmd[:5] == "vodka" || cmd[:5] == "водка":
+			format := "/me подаёт шот водки с небольшим маринованным огурчиком на блюдце для %s. Из огурчика торчит "
+			format += "небольшая вилочка."
+			j.Message = fmt.Sprintf(format, j.Misc.Username)
+
+		case cmd[:4] == "beer" || cmd[:4] == "пиво":
+			format := "/me бахает об стол перед %s кружкой холодного пива, часть пенной шапки сползает по запотевшей "
+			format += "стенке кружки."
+			j.Message = fmt.Sprintf(format, j.Misc.Username)
+
+		case cmd[:7] == "tequila" || cmd[:6] == "текила":
+			format := "/me ставит рядом с %s шот текилы, аккуратно на ребро стопки насаживает дольку лайма и ставит "
+			format += "кофейное блюдце с горочкой соли."
+			j.Message = fmt.Sprintf(format, j.Misc.Username)
+
+		case cmd[:6] == "whisky" || cmd[:5] == "виски":
+			format := "/me демонстративно достаёт из морозилки пару кубических камушков, бросает их в толстодонный "
+			format += "стакан и аккуратно наливает Jack Daniels. Запускает стакан вдоль барной стойки, он "
+			format += "останавливается около %s."
+			j.Message = fmt.Sprintf(format, j.Misc.Username)
+
+		case cmd[:8] == "absinthe" || cmd[:6] == "абсент":
+			format := "/me наливает абсент в стопку. Смочив кубик сахара в абсенте кладёт его на дырявую ложечку и "
+			format += "поджигает. Как только пламя потухнет, %s размешивает оплавившийся кубик в абсенте и подносит "
+			format += "стопку %s."
+			j.Message = fmt.Sprintf(format, j.Misc.BotNick, j.Misc.Username)
+
 		default:
 			cmdLen := len(cmd)
 			cmds := []string{"karma ", "карма "}
