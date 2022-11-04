@@ -11,6 +11,7 @@ import (
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
+	"github.com/cockroachdb/pebble/internal/manifest"
 )
 
 // TODO(jackson): Consider implementing an optimization to seek lower levels
@@ -20,27 +21,47 @@ import (
 // seeks would require introducing key comparisons to switchTo{Min,Max}Heap
 // where there currently are none.
 
-// Transform defines a transform function to be applied to a Span. A Transform
-// takes a Span as input and writes the transformed Span to the provided output
-// *Span pointer. The output Span's Keys slice may be reused by Transform to
-// reduce allocations.
-type Transform func(cmp base.Compare, in Span, out *Span) error
+// Transformer defines a transformation to be applied to a Span.
+type Transformer interface {
+	// Transform takes a Span as input and writes the transformed Span to the
+	// provided output *Span pointer. The output Span's Keys slice may be reused
+	// by Transform to reduce allocations.
+	Transform(cmp base.Compare, in Span, out *Span) error
+}
 
-func noopTransform(_ base.Compare, s Span, dst *Span) error {
+// The TransformerFunc type is an adapter to allow the use of ordinary functions
+// as Transformers. If f is a function with the appropriate signature,
+// TransformerFunc(f) is a Transformer that calls f.
+type TransformerFunc func(base.Compare, Span, *Span) error
+
+// Transform calls f(cmp, in, out).
+func (tf TransformerFunc) Transform(cmp base.Compare, in Span, out *Span) error {
+	return tf(cmp, in, out)
+}
+
+var noopTransform Transformer = TransformerFunc(func(_ base.Compare, s Span, dst *Span) error {
 	dst.Start, dst.End = s.Start, s.End
 	dst.Keys = append(dst.Keys[:0], s.Keys...)
 	return nil
-}
+})
 
 // visibleTransform filters keys that are invisible at the provided snapshot
 // sequence number.
-func visibleTransform(snapshot uint64) Transform {
-	return func(_ base.Compare, s Span, dst *Span) error {
-		s = s.Visible(snapshot)
+func visibleTransform(snapshot uint64) Transformer {
+	return TransformerFunc(func(_ base.Compare, s Span, dst *Span) error {
 		dst.Start, dst.End = s.Start, s.End
-		dst.Keys = append(dst.Keys[:0], s.Keys...)
+		dst.Keys = dst.Keys[:0]
+		for _, k := range s.Keys {
+			// NB: The InternalKeySeqNumMax value is used for the batch snapshot
+			// because a batch's visible span keys are filtered when they're
+			// fragmented. There's no requirement to enforce visibility at
+			// iteration time.
+			if base.Visible(k.SeqNum(), snapshot, base.InternalKeySeqNumMax) {
+				dst.Keys = append(dst.Keys, k)
+			}
+		}
 		return nil
-	}
+	})
 }
 
 // MergingIter merges spans across levels of the LSM, exposing an iterator over
@@ -50,6 +71,10 @@ func visibleTransform(snapshot uint64) Transform {
 // fragmented spans. Each child iterator exposes fragmented key spans, such that
 // overlapping keys are surfaced in a single Span. Key spans from one child
 // iterator may overlap key spans from another child iterator arbitrarily.
+//
+// The spans combined by MergingIter will return spans with keys sorted by
+// trailer descending. If the MergingIter is configured with a Transformer, it's
+// permitted to modify the ordering of the spans' keys returned by MergingIter.
 //
 // Algorithm
 //
@@ -193,17 +218,17 @@ type MergingIter struct {
 	// buf is a buffer used to save [start, end) boundary keys.
 	buf []byte
 	// keys holds all of the keys across all levels that overlap the key span
-	// [start, end), sorted by sequence number and kind descending. This slice
-	// is reconstituted in synthesizeKeys from each mergingIterLevel's keys
-	// every time the [start, end) bounds change.
+	// [start, end), sorted by Trailer descending. This slice is reconstituted
+	// in synthesizeKeys from each mergingIterLevel's keys every time the
+	// [start, end) bounds change.
 	//
 	// Each element points into a child iterator's memory, so the keys may not
 	// be directly modified.
 	keys keysBySeqNumKind
-	// transform defines a function to be applied to a span before it's yielded
-	// to the user. A transform may filter individual keys contained within the
-	// span.
-	transform Transform
+	// transformer defines a transformation to be applied to a span before it's
+	// yielded to the user. Transforming may filter individual keys contained
+	// within the span.
+	transformer Transformer
 	// span holds the iterator's current span. This span is used as the
 	// destination for transforms. Every tranformed span overwrites the
 	// previous.
@@ -211,6 +236,17 @@ type MergingIter struct {
 
 	err error
 	dir int8
+
+	// alloc preallocates mergingIterLevel and mergingIterItems for use by the
+	// merging iterator. As long as the merging iterator is used with
+	// manifest.NumLevels+3 and fewer fragment iterators, the merging iterator
+	// will not need to allocate upon initialization. The value NumLevels+3
+	// mirrors the preallocated levels in iterAlloc used for point iterators.
+	// Invariant: cap(levels) == cap(items)
+	alloc struct {
+		levels [manifest.NumLevels + 3]mergingIterLevel
+		items  [manifest.NumLevels + 3]mergingIterItem
+	}
 }
 
 // MergingIter implements the FragmentIterator interface.
@@ -225,45 +261,82 @@ type mergingIterLevel struct {
 
 func (l *mergingIterLevel) next() {
 	if l.heapKey.kind == boundKindFragmentStart {
-		l.heapKey = endBound(l.heapKey.span)
+		l.heapKey = boundKey{
+			kind: boundKindFragmentEnd,
+			key:  l.heapKey.span.End,
+			span: l.heapKey.span,
+		}
 		return
 	}
-	l.heapKey = startBound(l.iter.Next())
+	if s := l.iter.Next(); s == nil {
+		l.heapKey = boundKey{kind: boundKindInvalid}
+	} else {
+		l.heapKey = boundKey{
+			kind: boundKindFragmentStart,
+			key:  s.Start,
+			span: s,
+		}
+	}
 }
 
 func (l *mergingIterLevel) prev() {
 	if l.heapKey.kind == boundKindFragmentEnd {
-		l.heapKey = startBound(l.heapKey.span)
+		l.heapKey = boundKey{
+			kind: boundKindFragmentStart,
+			key:  l.heapKey.span.Start,
+			span: l.heapKey.span,
+		}
 		return
 	}
-	l.heapKey = endBound(l.iter.Prev())
+	if s := l.iter.Prev(); s == nil {
+		l.heapKey = boundKey{kind: boundKindInvalid}
+	} else {
+		l.heapKey = boundKey{
+			kind: boundKindFragmentEnd,
+			key:  s.End,
+			span: s,
+		}
+	}
 }
 
 // Init initializes the merging iterator with the provided fragment iterators.
-func (m *MergingIter) Init(cmp base.Compare, transform Transform, iters ...FragmentIterator) {
+func (m *MergingIter) Init(cmp base.Compare, transformer Transformer, iters ...FragmentIterator) {
 	levels, items := m.levels, m.heap.items
 
 	*m = MergingIter{
-		heap:      mergingIterHeap{cmp: cmp},
-		transform: transform,
+		heap:        mergingIterHeap{cmp: cmp},
+		transformer: transformer,
 	}
-	// Invariant: cap(levels) == cap(items)
-	if cap(levels) < len(iters) {
-		m.levels = make([]mergingIterLevel, len(iters))
-		m.heap.items = make([]mergingIterItem, 0, len(iters))
-	} else {
+
+	// Invariant: cap(levels) >= cap(items)
+	// Invariant: cap(alloc.levels) == cap(alloc.items)
+	if len(iters) <= len(m.alloc.levels) {
+		// The slices allocated on the MergingIter struct are large enough.
+		m.levels = m.alloc.levels[:len(iters)]
+		m.heap.items = m.alloc.items[:0]
+	} else if len(iters) <= cap(levels) {
+		// The existing heap-allocated slices are large enough, so reuse them.
 		m.levels = levels[:len(iters)]
 		m.heap.items = items[:0]
+	} else {
+		// Heap allocate new slices.
+		m.levels = make([]mergingIterLevel, len(iters))
+		m.heap.items = make([]mergingIterItem, 0, len(iters))
 	}
 	for i := range m.levels {
-		m.levels[i] = mergingIterLevel{}
-		m.levels[i].iter = iters[i]
+		m.levels[i] = mergingIterLevel{iter: iters[i]}
 	}
+}
+
+// AddLevel adds a new level to the bottom of the merging iterator. AddLevel
+// must be called after Init and before any other method.
+func (m *MergingIter) AddLevel(iter FragmentIterator) {
+	m.levels = append(m.levels, mergingIterLevel{iter: iter})
 }
 
 // SeekGE moves the iterator to the first span with a start key greater than or
 // equal to key.
-func (m *MergingIter) SeekGE(key []byte) Span {
+func (m *MergingIter) SeekGE(key []byte) *Span {
 	m.invalidate() // clear state about current position
 	for i := range m.levels {
 		l := &m.levels[i]
@@ -277,24 +350,35 @@ func (m *MergingIter) SeekGE(key []byte) Span {
 		// Otherwise we use the start boundary of the next span which
 		// necessarily has a start ≥ key.
 		s := l.iter.SeekLT(key)
-		if s.Valid() && m.cmp(s.End, key) >= 0 {
+		if s != nil && m.cmp(s.End, key) >= 0 {
 			// s.End ≥ key
 			// We need to use this span's end bound.
-			l.heapKey = endBound(s)
+			l.heapKey = boundKey{
+				kind: boundKindFragmentEnd,
+				key:  s.End,
+				span: s,
+			}
 			continue
 		}
 		// s.End < key
 		// The span `s` ends before key. Next to the first span with a Start ≥
 		// key, and use that.
-		s = l.iter.Next()
-		l.heapKey = startBound(s)
+		if s = l.iter.Next(); s == nil {
+			l.heapKey = boundKey{kind: boundKindInvalid}
+		} else {
+			l.heapKey = boundKey{
+				kind: boundKindFragmentStart,
+				key:  s.Start,
+				span: s,
+			}
+		}
 	}
 	m.initMinHeap()
 	return m.findNextFragmentSet()
 }
 
 // SeekLT moves the iterator to the last span with a start key less than key.
-func (m *MergingIter) SeekLT(key []byte) Span {
+func (m *MergingIter) SeekLT(key []byte) *Span {
 	// TODO(jackson): Evaluate whether there's an implementation of SeekLT
 	// independent of SeekGE that is more efficient. It's tricky, because the
 	// span we should return might straddle `key` itself.
@@ -314,42 +398,56 @@ func (m *MergingIter) SeekLT(key []byte) Span {
 	// Start user key < key: [b,l)#1. This requires examining bounds both < 'c'
 	// (the 'b' of [b,m)#1's start key) and bounds ≥ 'c' (the 'l' of ([a,l)#2's
 	// end key).
-	if s := m.SeekGE(key); !s.Valid() && m.err != nil {
-		return Span{}
+	if s := m.SeekGE(key); s == nil && m.err != nil {
+		return nil
 	}
 	// Prev to the previous span.
 	return m.Prev()
 }
 
 // First seeks the iterator to the first span.
-func (m *MergingIter) First() Span {
+func (m *MergingIter) First() *Span {
 	m.invalidate() // clear state about current position
 	for i := range m.levels {
-		l := &m.levels[i]
-		l.heapKey = startBound(l.iter.First())
+		if s := m.levels[i].iter.First(); s == nil {
+			m.levels[i].heapKey = boundKey{kind: boundKindInvalid}
+		} else {
+			m.levels[i].heapKey = boundKey{
+				kind: boundKindFragmentStart,
+				key:  s.Start,
+				span: s,
+			}
+		}
 	}
 	m.initMinHeap()
 	return m.findNextFragmentSet()
 }
 
 // Last seeks the iterator to the last span.
-func (m *MergingIter) Last() Span {
+func (m *MergingIter) Last() *Span {
 	m.invalidate() // clear state about current position
 	for i := range m.levels {
-		l := &m.levels[i]
-		l.heapKey = endBound(l.iter.Last())
+		if s := m.levels[i].iter.Last(); s == nil {
+			m.levels[i].heapKey = boundKey{kind: boundKindInvalid}
+		} else {
+			m.levels[i].heapKey = boundKey{
+				kind: boundKindFragmentEnd,
+				key:  s.End,
+				span: s,
+			}
+		}
 	}
 	m.initMaxHeap()
 	return m.findPrevFragmentSet()
 }
 
 // Next advances the iterator to the next span.
-func (m *MergingIter) Next() Span {
+func (m *MergingIter) Next() *Span {
 	if m.err != nil {
-		return Span{}
+		return nil
 	}
 	if m.dir == +1 && (m.end == nil || m.start == nil) {
-		return Span{}
+		return nil
 	}
 	if m.dir != +1 {
 		m.switchToMinHeap()
@@ -358,12 +456,12 @@ func (m *MergingIter) Next() Span {
 }
 
 // Prev advances the iterator to the previous span.
-func (m *MergingIter) Prev() Span {
+func (m *MergingIter) Prev() *Span {
 	if m.err != nil {
-		return Span{}
+		return nil
 	}
 	if m.dir == -1 && (m.end == nil || m.start == nil) {
-		return Span{}
+		return nil
 	}
 	if m.dir != -1 {
 		m.switchToMaxHeap()
@@ -533,7 +631,7 @@ func (m *MergingIter) cmp(a, b []byte) int {
 	return m.heap.cmp(a, b)
 }
 
-func (m *MergingIter) findNextFragmentSet() Span {
+func (m *MergingIter) findNextFragmentSet() *Span {
 	// Each iteration of this loop considers a new merged span between unique
 	// user keys. An iteration may find that there exists no overlap for a given
 	// span, (eg, if the spans [a,b), [d, e) exist within level iterators, the
@@ -601,16 +699,16 @@ func (m *MergingIter) findNextFragmentSet() Span {
 		// we elide empty spans created by the mergingIter itself that don't overlap
 		// with any child iterator returned spans (i.e. empty spans that bridge two
 		// distinct child-iterator-defined spans).
-		if found, s := m.synthesizeKeys(+1); found && s.Valid() {
+		if found, s := m.synthesizeKeys(+1); found && s != nil {
 			return s
 		}
 	}
 	// Exhausted.
 	m.clear()
-	return Span{}
+	return nil
 }
 
-func (m *MergingIter) findPrevFragmentSet() Span {
+func (m *MergingIter) findPrevFragmentSet() *Span {
 	// Each iteration of this loop considers a new merged span between unique
 	// user keys. An iteration may find that there exists no overlap for a given
 	// span, (eg, if the spans [a,b), [d, e) exist within level iterators, the
@@ -677,13 +775,13 @@ func (m *MergingIter) findPrevFragmentSet() Span {
 		// we elide empty spans created by the mergingIter itself that don't overlap
 		// with any child iterator returned spans (i.e. empty spans that bridge two
 		// distinct child-iterator-defined spans).
-		if found, s := m.synthesizeKeys(-1); found && s.Valid() {
+		if found, s := m.synthesizeKeys(-1); found && s != nil {
 			return s
 		}
 	}
 	// Exhausted.
 	m.clear()
-	return Span{}
+	return nil
 }
 
 func (m *MergingIter) heapRoot() []byte {
@@ -703,7 +801,7 @@ func (m *MergingIter) heapRoot() []byte {
 //
 // The boolean return value, `found`, is true if the returned span overlaps
 // with a span returned by a child iterator.
-func (m *MergingIter) synthesizeKeys(dir int8) (bool, Span) {
+func (m *MergingIter) synthesizeKeys(dir int8) (bool, *Span) {
 	if invariants.Enabled {
 		if m.cmp(m.start, m.end) >= 0 {
 			panic(fmt.Sprintf("pebble: invariant violation: span start ≥ end: %s >= %s", m.start, m.end))
@@ -719,19 +817,26 @@ func (m *MergingIter) synthesizeKeys(dir int8) (bool, Span) {
 			found = true
 		}
 	}
+	// TODO(jackson): We should be able to remove this sort and instead
+	// guarantee that we'll return keys in the order of the levels they're from.
+	// With careful iterator construction, this would  guarantee that they're
+	// sorted by trailer descending for the range key iteration use case.
 	sort.Sort(&m.keys)
 
-	// Apply the configured transform. See VisibleTransform.
+	// Apply the configured transform. See visibleTransform.
 	s := Span{
-		Start: m.start,
-		End:   m.end,
-		Keys:  m.keys,
+		Start:     m.start,
+		End:       m.end,
+		Keys:      m.keys,
+		KeysOrder: ByTrailerDesc,
 	}
-	if err := m.transform(m.cmp, s, &m.span); err != nil {
+	// NB: m.heap.cmp is a base.Compare, whereas m.cmp is a method on
+	// MergingIter.
+	if err := m.transformer.Transform(m.heap.cmp, s, &m.span); err != nil {
 		m.err = err
-		return false, Span{}
+		return false, nil
 	}
-	return found, m.span
+	return found, &m.span
 }
 
 func (m *MergingIter) invalidate() {
@@ -885,28 +990,6 @@ func (h *mergingIterHeap) down(i0, n int) bool {
 	return i > i0
 }
 
-func startBound(s Span) boundKey {
-	if !s.Valid() {
-		return boundKey{kind: boundKindInvalid}
-	}
-	return boundKey{
-		kind: boundKindFragmentStart,
-		key:  s.Start,
-		span: s,
-	}
-}
-
-func endBound(s Span) boundKey {
-	if !s.Valid() {
-		return boundKey{kind: boundKindInvalid}
-	}
-	return boundKey{
-		kind: boundKindFragmentEnd,
-		key:  s.End,
-		span: s,
-	}
-}
-
 type boundKind int8
 
 const (
@@ -922,7 +1005,7 @@ type boundKey struct {
 	//
 	// If kind is boundKindFragmentStart, then key is span.Start. If kind is
 	// boundKindFragmentEnd, then key is span.End.
-	span Span
+	span *Span
 }
 
 func (k boundKey) valid() bool {

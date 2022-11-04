@@ -69,10 +69,10 @@ func ingestLoad1(
 	if err != nil {
 		return nil, err
 	}
-	if tf > fmv.MaxTableFormat() {
+	if tf < fmv.MinTableFormat() || tf > fmv.MaxTableFormat() {
 		return nil, errors.Newf(
-			"pebble: table with format %s unsupported at DB format major version %d, %s",
-			tf, fmv, fmv.MaxTableFormat(),
+			"pebble: table format %s is not within range supported at DB format major version %d, (%s,%s)",
+			tf, fmv, fmv.MinTableFormat(), fmv.MaxTableFormat(),
 		)
 	}
 
@@ -126,7 +126,7 @@ func ingestLoad1(
 	if iter != nil {
 		defer iter.Close()
 		var smallest InternalKey
-		if s := iter.First(); s.Valid() {
+		if s := iter.First(); s != nil {
 			key := s.SmallestKey()
 			if err := ingestValidateKey(opts, &key); err != nil {
 				return nil, err
@@ -136,7 +136,7 @@ func ingestLoad1(
 		if err := iter.Error(); err != nil {
 			return nil, err
 		}
-		if s := iter.Last(); s.Valid() {
+		if s := iter.Last(); s != nil {
 			k := s.SmallestKey()
 			if err := ingestValidateKey(opts, &k); err != nil {
 				return nil, err
@@ -155,7 +155,7 @@ func ingestLoad1(
 		if iter != nil {
 			defer iter.Close()
 			var smallest InternalKey
-			if s := iter.First(); s.Valid() {
+			if s := iter.First(); s != nil {
 				key := s.SmallestKey()
 				if err := ingestValidateKey(opts, &key); err != nil {
 					return nil, err
@@ -165,7 +165,7 @@ func ingestLoad1(
 			if err := iter.Error(); err != nil {
 				return nil, err
 			}
-			if s := iter.Last(); s.Valid() {
+			if s := iter.Last(); s != nil {
 				k := s.SmallestKey()
 				if err := ingestValidateKey(opts, &k); err != nil {
 					return nil, err
@@ -271,7 +271,8 @@ func ingestLink(
 	fs := syncingFS{
 		FS: opts.FS,
 		syncOpts: vfs.SyncingFileOptions{
-			BytesPerSync: opts.BytesPerSync,
+			NoSyncOnClose: opts.NoSyncOnClose,
+			BytesPerSync:  opts.BytesPerSync,
 		},
 	}
 
@@ -397,7 +398,7 @@ func overlapWithIterator(
 	//    means boundary < L and hence is similar to 1).
 	// 4) boundary == L and L is sentinel,
 	//    we'll always overlap since for any values of i,j ranges [i, k) and [j, k) always overlap.
-	key, _ := iter.SeekGE(meta.Smallest.UserKey, false /* trySeekUsingNext */)
+	key, _ := iter.SeekGE(meta.Smallest.UserKey, base.SeekGEFlagsNone)
 	if key != nil {
 		c := sstableKeyCompare(cmp, *key, meta.Largest)
 		if c <= 0 {
@@ -411,10 +412,10 @@ func overlapWithIterator(
 	}
 	rangeDelItr := *rangeDelIter
 	rangeDel := rangeDelItr.SeekLT(meta.Smallest.UserKey)
-	if !rangeDel.Valid() {
+	if rangeDel == nil {
 		rangeDel = rangeDelItr.Next()
 	}
-	for ; rangeDel.Valid(); rangeDel = rangeDelItr.Next() {
+	for ; rangeDel != nil; rangeDel = rangeDelItr.Next() {
 		key := rangeDel.SmallestKey()
 		c := sstableKeyCompare(cmp, key, meta.Largest)
 		if c > 0 {
@@ -510,7 +511,7 @@ func ingestTargetLevel(
 			continue
 		}
 
-		iter, rangeDelIter, err := newIters(iter.Current(), nil, nil)
+		iter, rangeDelIter, err := newIters(iter.Current(), nil, internalIterOpts{})
 		if err != nil {
 			return 0, err
 		}
@@ -848,7 +849,7 @@ func (d *DB) ingestApply(
 	}); err != nil {
 		return nil, err
 	}
-	d.updateReadStateLocked(d.opts.DebugCheck, nil)
+	d.updateReadStateLocked(d.opts.DebugCheck)
 	d.updateTableStatsLocked(ve.NewFiles)
 	d.deleteObsoleteFiles(jobID, false /* waitForOngoing */)
 	// The ingestion may have pushed a level over the threshold for compaction,
