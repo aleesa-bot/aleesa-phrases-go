@@ -24,13 +24,14 @@ import (
 
 // Входящее сообщение из pubsub-канала redis-ки
 type rMsg struct {
-	From    string `json:"from,omitempty"`
-	ChatID  string `json:"chatid,omitempty"`
-	UserID  string `json:"userid,omitempty"`
-	Message string `json:"message,omitempty"`
-	Plugin  string `json:"plugin,omitempty"`
-	Mode    string `json:"mode,omitempty"`
-	Misc    struct {
+	From     string `json:"from,omitempty"`
+	ChatID   string `json:"chatid,omitempty"`
+	UserID   string `json:"userid,omitempty"`
+	ThreadID string `json:"threadid"`
+	Message  string `json:"message,omitempty"`
+	Plugin   string `json:"plugin,omitempty"`
+	Mode     string `json:"mode,omitempty"`
+	Misc     struct {
 		Answer      int64  `json:"answer,omitempty"`
 		BotNick     string `json:"bot_nick,omitempty"`
 		CSign       string `json:"csign,omitempty"`
@@ -43,13 +44,14 @@ type rMsg struct {
 
 // Исходящее сообщение в pubsub-канал redis-ки
 type sMsg struct {
-	From    string `json:"from"`
-	ChatID  string `json:"chatid"`
-	Userid  string `json:"userid"`
-	Message string `json:"message"`
-	Plugin  string `json:"plugin"`
-	Mode    string `json:"mode"`
-	Misc    struct {
+	From     string `json:"from"`
+	ChatID   string `json:"chatid"`
+	Userid   string `json:"userid"`
+	ThreadID string `json:"threadid"`
+	Message  string `json:"message"`
+	Plugin   string `json:"plugin"`
+	Mode     string `json:"mode"`
+	Misc     struct {
 		Answer      int64  `json:"answer"`
 		BotNick     string `json:"bot_nick"`
 		CSign       string `json:"csign"`
@@ -319,6 +321,8 @@ func msgParser(ctx context.Context, msg string) {
 		return
 	}
 
+	// j.ThreadID может быть пустым, это нормально
+
 	if exist := j.Message; exist == "" {
 		log.Warnf("Incorrect msg from redis, no message field: %s", msg)
 		return
@@ -458,6 +462,7 @@ func msgParser(ctx context.Context, msg string) {
 		message.From = j.From
 		message.Userid = j.UserID
 		message.ChatID = j.ChatID
+		message.ThreadID = j.ThreadID
 		message.Message = j.Message
 		message.Plugin = j.Plugin
 		message.Mode = j.Mode
