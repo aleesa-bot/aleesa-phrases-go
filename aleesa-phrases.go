@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -242,6 +243,8 @@ func friday() string {
 	dayNum := int(time.Now().Weekday())
 
 	switch dayNum {
+	case 0:
+		phrase, err = FetchRandomV(pebbleDB.sunday.db, pebbleDB.sunday.name)
 	case 1:
 		phrase, err = FetchRandomV(pebbleDB.monday.db, pebbleDB.monday.name)
 	case 2:
@@ -254,8 +257,6 @@ func friday() string {
 		phrase, err = FetchRandomV(pebbleDB.friday.db, pebbleDB.friday.name)
 	case 6:
 		phrase, err = FetchRandomV(pebbleDB.saturday.db, pebbleDB.saturday.name)
-	case 7:
-		phrase, err = FetchRandomV(pebbleDB.sunday.db, pebbleDB.sunday.name)
 	}
 
 	if err != nil {
@@ -375,54 +376,46 @@ func msgParser(ctx context.Context, msg string) {
 	msgLen := len(j.Message)
 
 	if j.Message[0:len(j.Misc.CSign)] == j.Misc.CSign { //nolint:gocritic
-		switch cmd := j.Message[len(j.Misc.CSign):]; {
-		case cmd == "friday" || cmd == "пятница":
+		cmd := j.Message[len(j.Misc.CSign):]
+
+		if cmd == "friday" || cmd == "пятница" {
 			j.Message = friday()
-
-		case cmd == "proverb" || cmd == "пословица":
+		} else if (cmd == "proverb") || (cmd == "пословица") {
 			j.Message = proverb()
-
-		case cmd == "f" || cmd == "ф":
+		} else if (cmd == "f") || (cmd == "ф") {
 			j.Message = fortune()
-
-		case cmd == "fortune" || cmd == "фортунка":
+		} else if (cmd == "fortune") || (cmd == "фортунка") {
 			j.Message = fortune()
-
-		case cmd == "karma" || cmd == "карма":
+		} else if (cmd == "karma") || (cmd == "карма") {
 			j.Message = getKarma(j.ChatID, "")
-
-		case cmd[:3] == "rum" || cmd[:3] == "ром":
+		} else if match, _ := regexp.MatchString("^(rum|ром)[::space::]?([::space::].+)*$", cmd); match {
 			format := "/me притаскивает на подносе стопку рома для %s, края стопки искрятся кристаллами соли."
 			j.Message = fmt.Sprintf(format, j.Misc.Username)
-
-		case cmd[:5] == "vodka" || cmd[:5] == "водка":
+		} else if match, _ := regexp.MatchString("^(vodka|водка)[::space::]?([::space::].+)*$", cmd); match {
 			format := "/me подаёт шот водки с небольшим маринованным огурчиком на блюдце для %s. Из огурчика торчит "
 			format += "небольшая вилочка."
 			j.Message = fmt.Sprintf(format, j.Misc.Username)
-
-		case cmd[:4] == "beer" || cmd[:4] == "пиво":
+		} else if match, _ := regexp.MatchString("^(beer|пиво)[::space::]?([::space::].+)*$", cmd); match {
 			format := "/me бахает об стол перед %s кружкой холодного пива, часть пенной шапки сползает по запотевшей "
 			format += "стенке кружки."
 			j.Message = fmt.Sprintf(format, j.Misc.Username)
-
-		case cmd[:7] == "tequila" || cmd[:6] == "текила":
+		} else if match, _ := regexp.MatchString("^(tequila|текила)[::space::]?([::space::].+)*$", cmd); match {
 			format := "/me ставит рядом с %s шот текилы, аккуратно на ребро стопки насаживает дольку лайма и ставит "
 			format += "кофейное блюдце с горочкой соли."
 			j.Message = fmt.Sprintf(format, j.Misc.Username)
-
-		case cmd[:6] == "whisky" || cmd[:5] == "виски":
+		} else if match, _ := regexp.MatchString("^(whisky|виски)[::space::]?([::space::].+)*$", cmd); match {
 			format := "/me демонстративно достаёт из морозилки пару кубических камушков, бросает их в толстодонный "
 			format += "стакан и аккуратно наливает Jack Daniels. Запускает стакан вдоль барной стойки, он "
 			format += "останавливается около %s."
 			j.Message = fmt.Sprintf(format, j.Misc.Username)
-
-		case cmd[:8] == "absinthe" || cmd[:6] == "абсент":
+		} else if match, _ := regexp.MatchString("^(absinth|абсент)[::space::]?([::space::].+)*$", cmd); match {
 			format := "/me наливает абсент в стопку. Смочив кубик сахара в абсенте кладёт его на дырявую ложечку и "
 			format += "поджигает. Как только пламя потухнет, %s размешивает оплавившийся кубик в абсенте и подносит "
 			format += "стопку %s."
 			j.Message = fmt.Sprintf(format, j.Misc.BotNick, j.Misc.Username)
-
-		default:
+		} else if match, _ := regexp.MatchString("^fuck[::space::]*$", cmd); match {
+			j.Message = "Не ругайся."
+		} else {
 			cmdLen := len(cmd)
 			cmds := []string{"karma ", "карма "}
 
@@ -603,6 +596,14 @@ func init() {
 	default:
 		log.SetLevel(log.InfoLevel)
 	}
+
+	// Надеюсь, это заловит все ошибки и паники в лог при падении программы
+	defer func() {
+		if err := recover(); err != nil {
+			log.Fatalf("Exception: %v\n", err)
+			os.Exit(1)
+		}
+	}()
 
 	var err error
 	// Самое гнусное - открыть базки со статичными фразами, конкретно тут - в RO-режиме
