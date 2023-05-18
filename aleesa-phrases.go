@@ -380,7 +380,7 @@ func msgParser(ctx context.Context, msg string) {
 
 		if cmd == "friday" || cmd == "пятница" {
 			j.Message = friday()
-		} else if (cmd == "proverb") || (cmd == "пословица") {
+		} else if (cmd == "proverb") || (cmd == "пословица") || (cmd == "пословиться") {
 			j.Message = proverb()
 		} else if (cmd == "f") || (cmd == "ф") {
 			j.Message = fortune()
