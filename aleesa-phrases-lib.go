@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -131,7 +130,7 @@ func ReadConfig() MyConfig {
 			continue
 		}
 
-		buf, err := ioutil.ReadFile(location)
+		buf, err := os.ReadFile(location)
 
 		// Не удалось прочитать, попробуем следующего кандидата
 		if err != nil {

@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 
@@ -50,7 +49,7 @@ func main() {
 
 		// "Заглатывать" файл целиком - плохая практика, но мы предополагаем, что файлы будут небольшие.
 		fortuneFile := fmt.Sprintf("%s/%s", srcDir, file.Name())
-		bytesRead, err := ioutil.ReadFile(fortuneFile)
+		bytesRead, err := os.ReadFile(fortuneFile)
 
 		if err != nil {
 			log.Errorf("Unable to read %s: %s\n", file.Name(), err)

@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"strconv"
@@ -80,7 +79,7 @@ func main() {
 	}
 
 	file := config.DataDir + "/friday_src/friday.txt"
-	bytesRead, err := ioutil.ReadFile(file)
+	bytesRead, err := os.ReadFile(file)
 
 	if err != nil {
 		log.Errorf("Unable to read %s: %s\n", file, err)
