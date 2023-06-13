@@ -210,8 +210,8 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		write:         d.commitWrite,
 	})
 	d.deletionLimiter = rate.NewLimiter(
-		rate.Limit(d.opts.Experimental.MinDeletionRate),
-		d.opts.Experimental.MinDeletionRate)
+		rate.Limit(d.opts.TargetByteDeletionRate),
+		d.opts.TargetByteDeletionRate)
 	d.mu.nextJobID = 1
 	d.mu.mem.nextSize = opts.MemTableSize
 	if d.mu.mem.nextSize > initialMemTableSize {
@@ -512,7 +512,7 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	}
 	d.mu.tableStats.cond.L = &d.mu.Mutex
 	d.mu.tableValidation.cond.L = &d.mu.Mutex
-	if !d.opts.ReadOnly && !d.opts.private.disableTableStats {
+	if !d.opts.ReadOnly {
 		d.maybeCollectTableStatsLocked()
 	}
 	d.calculateDiskAvailableBytes()
@@ -804,13 +804,12 @@ func (d *DB) replayWAL(
 					paths[i] = base.MakeFilepath(d.opts.FS, d.dirname, fileTypeTable, n)
 				}
 
-				var meta []*manifest.FileMetadata
-				meta, _, err = ingestLoad(
-					d.opts, d.mu.formatVers.vers, paths, d.cacheID, fileNums,
-				)
+				var lr ingestLoadResult
+				lr, err = ingestLoad(d.opts, d.mu.formatVers.vers, paths, nil, d.cacheID, fileNums)
 				if err != nil {
 					return nil, 0, err
 				}
+				meta := lr.localMeta
 
 				if uint32(len(meta)) != b.Count() {
 					panic("pebble: couldn't load all files in WAL entry.")

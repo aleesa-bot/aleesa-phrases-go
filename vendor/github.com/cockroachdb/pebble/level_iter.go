@@ -36,9 +36,9 @@ type tableNewIters func(
 // tableNewRangeDelIter takes a tableNewIters and returns a TableNewSpanIter
 // for the rangedel iterator returned by tableNewIters.
 func tableNewRangeDelIter(ctx context.Context, newIters tableNewIters) keyspan.TableNewSpanIter {
-	return func(file *manifest.FileMetadata, iterOptions *keyspan.SpanIterOptions) (keyspan.FragmentIterator, error) {
+	return func(file *manifest.FileMetadata, iterOptions keyspan.SpanIterOptions) (keyspan.FragmentIterator, error) {
 		iter, rangeDelIter, err := newIters(
-			ctx, file, &IterOptions{RangeKeyFilters: iterOptions.RangeKeyFilters}, internalIterOpts{})
+			ctx, file, &IterOptions{RangeKeyFilters: iterOptions.RangeKeyFilters, level: iterOptions.Level}, internalIterOpts{})
 		if iter != nil {
 			_ = iter.Close()
 		}
@@ -200,6 +200,11 @@ type levelIter struct {
 	// cache when constructing new table iterators.
 	internalOpts internalIterOpts
 
+	// Scratch space for the obsolete keys filter, when there are no other block
+	// property filters specified. See the performance note where
+	// IterOptions.PointKeyFilters is declared.
+	filtersBuf [1]BlockPropertyFilter
+
 	// Disable invariant checks even if they are otherwise enabled. Used by tests
 	// which construct "impossible" situations (e.g. seeking to a key before the
 	// lower bound).
@@ -267,8 +272,12 @@ func (l *levelIter) init(
 	l.upper = opts.UpperBound
 	l.tableOpts.TableFilter = opts.TableFilter
 	l.tableOpts.PointKeyFilters = opts.PointKeyFilters
+	if len(opts.PointKeyFilters) == 0 {
+		l.tableOpts.PointKeyFilters = l.filtersBuf[:0:1]
+	}
 	l.tableOpts.UseL6Filters = opts.UseL6Filters
 	l.tableOpts.level = l.level
+	l.tableOpts.snapshotForHideObsoletePoints = opts.snapshotForHideObsoletePoints
 	l.cmp = cmp
 	l.split = split
 	l.iterFile = nil

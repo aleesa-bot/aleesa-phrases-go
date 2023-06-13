@@ -1333,10 +1333,10 @@ func (c *compaction) newInputIter(
 	// internal iterator interface). The resulting merged rangedel iterator is
 	// then included with the point levels in a single mergingIter.
 	newRangeDelIter := func(
-		f manifest.LevelFile, _ *IterOptions, bytesIterated *uint64,
+		f manifest.LevelFile, _ *IterOptions, l manifest.Level, bytesIterated *uint64,
 	) (keyspan.FragmentIterator, error) {
 		iter, rangeDelIter, err := newIters(context.Background(), f.FileMetadata,
-			nil /* iter options */, internalIterOpts{bytesIterated: &c.bytesIterated})
+			&IterOptions{level: l}, internalIterOpts{bytesIterated: &c.bytesIterated})
 		if err == nil {
 			// TODO(peter): It is mildly wasteful to open the point iterator only to
 			// immediately close it. One way to solve this would be to add new
@@ -1415,6 +1415,10 @@ func (c *compaction) newInputIter(
 	iterOpts := IterOptions{logger: c.logger}
 	// TODO(bananabrick): Get rid of the extra manifest.Level parameter and fold it into
 	// compactionLevel.
+	//
+	// TODO(bilal): when we start using strict obsolete sstables for L5 and L6
+	// in disaggregated storage, and rely on the obsolete bit, we will also need
+	// to configure the levelIter at these levels to hide the obsolete points.
 	addItersForLevel := func(level *compactionLevel, l manifest.Level) error {
 		iters = append(iters, newLevelIter(iterOpts, c.cmp, nil /* split */, newIters,
 			level.files.Iter(), l, &c.bytesIterated))
@@ -1455,8 +1459,10 @@ func (c *compaction) newInputIter(
 		// mergingIter.
 		iter := level.files.Iter()
 		for f := iter.First(); f != nil; f = iter.Next() {
-			rangeDelIter, err := newRangeDelIter(iter.Take(), nil, &c.bytesIterated)
+			rangeDelIter, err := newRangeDelIter(iter.Take(), nil, l, &c.bytesIterated)
 			if err != nil {
+				// The error will already be annotated with the BackingFileNum, so
+				// we annotate it with the FileNum.
 				return errors.Wrapf(err, "pebble: could not open table %s", errors.Safe(f.FileNum))
 			}
 			if rangeDelIter != emptyKeyspanIter {
@@ -1474,7 +1480,7 @@ func (c *compaction) newInputIter(
 		}
 		if hasRangeKeys {
 			li := &keyspan.LevelIter{}
-			newRangeKeyIterWrapper := func(file *manifest.FileMetadata, iterOptions *keyspan.SpanIterOptions) (keyspan.FragmentIterator, error) {
+			newRangeKeyIterWrapper := func(file *manifest.FileMetadata, iterOptions keyspan.SpanIterOptions) (keyspan.FragmentIterator, error) {
 				iter, err := newRangeKeyIter(file, iterOptions)
 				if iter != nil {
 					// Ensure that the range key iter is not closed until the compaction is
@@ -1495,7 +1501,7 @@ func (c *compaction) newInputIter(
 				}
 				return iter, err
 			}
-			li.Init(keyspan.SpanIterOptions{}, c.cmp, newRangeKeyIterWrapper, level.files.Iter(), l, manifest.KeyTypeRange)
+			li.Init(keyspan.SpanIterOptions{Level: l}, c.cmp, newRangeKeyIterWrapper, level.files.Iter(), l, manifest.KeyTypeRange)
 			rangeKeyIters = append(rangeKeyIters, li)
 		}
 		return nil
@@ -2066,12 +2072,12 @@ func (d *DB) flush1() (bytesFlushed uint64, err error) {
 	bytesFlushed = c.bytesIterated
 	d.mu.snapshots.cumulativePinnedCount += stats.cumulativePinnedKeys
 	d.mu.snapshots.cumulativePinnedSize += stats.cumulativePinnedSize
+	d.mu.versions.metrics.Keys.MissizedTombstonesCount += stats.countMissizedDels
 
 	d.maybeUpdateDeleteCompactionHints(c)
 	d.clearCompactingState(c, err != nil)
 	delete(d.mu.compact.inProgress, c)
 	d.mu.versions.incrementCompactions(c.kind, c.extraLevels)
-	d.mu.versions.incrementCompactionBytes(-c.bytesWritten)
 
 	var flushed flushableList
 	if err == nil {
@@ -2559,9 +2565,20 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 	info.Duration = d.timeNow().Sub(startTime)
 	if err == nil {
 		d.mu.versions.logLock()
-		err = d.mu.versions.logAndApply(jobID, ve, c.metrics, false /* forceRotation */, func() []compactionInfo {
-			return d.getInProgressCompactionInfoLocked(c)
-		})
+		// Confirm if any of this compaction's inputs were deleted while this
+		// compaction was ongoing.
+		for i := range c.inputs {
+			c.inputs[i].files.Each(func(m *manifest.FileMetadata) {
+				if m.Deleted {
+					err = firstError(err, errors.New("pebble: file deleted by a concurrent operation, will retry compaction"))
+				}
+			})
+		}
+		if err == nil {
+			err = d.mu.versions.logAndApply(jobID, ve, c.metrics, false /* forceRotation */, func() []compactionInfo {
+				return d.getInProgressCompactionInfoLocked(c)
+			})
+		}
 		if err != nil {
 			// TODO(peter): untested.
 			for _, f := range pendingOutputs {
@@ -2617,6 +2634,7 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 type compactStats struct {
 	cumulativePinnedKeys uint64
 	cumulativePinnedSize uint64
+	countMissizedDels    uint64
 }
 
 // runCompactions runs a compaction that produces new on-disk tables from
@@ -2850,10 +2868,12 @@ func (d *DB) runCompaction(
 			Path:    d.objProvider.Path(objMeta),
 			FileNum: fileNum,
 		})
-		writable = &compactionWritable{
-			Writable: writable,
-			versions: d.mu.versions,
-			written:  &c.bytesWritten,
+		if c.kind != compactionKindFlush {
+			writable = &compactionWritable{
+				Writable: writable,
+				versions: d.mu.versions,
+				written:  &c.bytesWritten,
+			}
 		}
 		createdFiles = append(createdFiles, fileNum.DiskFileNum())
 		cacheOpts := private.SSTableCacheOpts(d.cacheID, fileNum.DiskFileNum()).(sstable.WriterOption)
@@ -3232,7 +3252,10 @@ func (d *DB) runCompaction(
 					return nil, pendingOutputs, stats, err
 				}
 			}
-			if err := tw.Add(*key, val); err != nil {
+			// iter.snapshotPinned is broader than whether the point was covered by
+			// a RANGEDEL, but it is harmless to pass true when the callee will also
+			// independently discover that the point is obsolete.
+			if err := tw.AddWithForceObsolete(*key, val, iter.snapshotPinned); err != nil {
 				return nil, pendingOutputs, stats, err
 			}
 			if iter.snapshotPinned {
@@ -3284,6 +3307,11 @@ func (d *DB) runCompaction(
 			}] = f
 		}
 	}
+
+	// The compaction iterator keeps track of a count of the number of DELSIZED
+	// keys that encoded an incorrect size. Propagate it up as a part of
+	// compactStats.
+	stats.countMissizedDels = iter.stats.countMissizedDels
 
 	if err := d.objProvider.Sync(); err != nil {
 		return nil, pendingOutputs, stats, err
@@ -3613,7 +3641,7 @@ func (d *DB) doDeleteObsoleteFiles(jobID int) {
 	if len(filesToDelete) > 0 {
 		d.deleters.Add(1)
 		// Delete asynchronously if that could get held up in the pacer.
-		if d.opts.Experimental.MinDeletionRate > 0 {
+		if d.opts.TargetByteDeletionRate > 0 {
 			go d.paceAndDeleteObsoleteFiles(jobID, filesToDelete)
 		} else {
 			d.paceAndDeleteObsoleteFiles(jobID, filesToDelete)
@@ -3626,14 +3654,20 @@ func (d *DB) doDeleteObsoleteFiles(jobID int) {
 func (d *DB) paceAndDeleteObsoleteFiles(jobID int, files []obsoleteFile) {
 	defer d.deleters.Done()
 	pacer := (pacer)(nilPacer)
-	if d.opts.Experimental.MinDeletionRate > 0 {
+	if d.opts.TargetByteDeletionRate > 0 {
 		pacer = newDeletionPacer(d.deletionLimiter, d.getDeletionPacerInfo)
 	}
 
 	for _, of := range files {
 		path := base.MakeFilepath(d.opts.FS, of.dir, of.fileType, of.fileNum)
 		if of.fileType == fileTypeTable {
-			_ = pacer.maybeThrottle(of.fileSize)
+			// Don't throttle deletion of shared objects.
+			meta, err := d.objProvider.Lookup(of.fileType, of.fileNum)
+			// If we get an error here, deleteObsoleteObject won't actually delete
+			// anything, so we don't need to throttle.
+			if err == nil && !meta.IsShared() {
+				_ = pacer.maybeThrottle(of.fileSize)
+			}
 			d.mu.Lock()
 			d.mu.versions.metrics.Table.ObsoleteCount--
 			d.mu.versions.metrics.Table.ObsoleteSize -= of.fileSize

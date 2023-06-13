@@ -96,6 +96,22 @@ type Writer interface {
 	// It is safe to modify the contents of the arguments after Delete returns.
 	Delete(key []byte, o *WriteOptions) error
 
+	// DeleteSized behaves identically to Delete, but takes an additional
+	// argument indicating the size of the value being deleted. DeleteSized
+	// should be preferred when the caller has the expectation that there exists
+	// a single internal KV pair for the key (eg, the key has not been
+	// overwritten recently), and the caller knows the size of its value.
+	//
+	// DeleteSized will record the value size within the tombstone and use it to
+	// inform compaction-picking heuristics which strive to reduce space
+	// amplification in the LSM. This "calling your shot" mechanic allows the
+	// storage engine to more accurately estimate and reduce space
+	// amplification.
+	//
+	// It is safe to modify the contents of the arguments after DeleteSized
+	// returns.
+	DeleteSized(key []byte, valueSize uint32, _ *WriteOptions) error
+
 	// SingleDelete is similar to Delete in that it deletes the value for the given key. Like Delete,
 	// it is a blind operation that will succeed even if the given key does not exist.
 	//
@@ -620,6 +636,30 @@ func (d *DB) Delete(key []byte, opts *WriteOptions) error {
 	return nil
 }
 
+// DeleteSized behaves identically to Delete, but takes an additional
+// argument indicating the size of the value being deleted. DeleteSized
+// should be preferred when the caller has the expectation that there exists
+// a single internal KV pair for the key (eg, the key has not been
+// overwritten recently), and the caller knows the size of its value.
+//
+// DeleteSized will record the value size within the tombstone and use it to
+// inform compaction-picking heuristics which strive to reduce space
+// amplification in the LSM. This "calling your shot" mechanic allows the
+// storage engine to more accurately estimate and reduce space amplification.
+//
+// It is safe to modify the contents of the arguments after DeleteSized
+// returns.
+func (d *DB) DeleteSized(key []byte, valueSize uint32, opts *WriteOptions) error {
+	b := newBatch(d)
+	_ = b.DeleteSized(key, valueSize, opts)
+	if err := d.Apply(b, opts); err != nil {
+		return err
+	}
+	// Only release the batch on success.
+	b.release()
+	return nil
+}
+
 // SingleDelete adds an action to the batch that single deletes the entry for key.
 // See Writer.SingleDelete for more details on the semantics of SingleDelete.
 //
@@ -786,17 +826,19 @@ func (d *DB) applyInternal(batch *Batch, opts *WriteOptions, noSyncWait bool) er
 		return errors.New("pebble: WAL disabled")
 	}
 
+	if batch.minimumFormatMajorVersion != FormatMostCompatible {
+		if fmv := d.FormatMajorVersion(); fmv < batch.minimumFormatMajorVersion {
+			panic(fmt.Sprintf(
+				"pebble: batch requires at least format major version %d (current: %d)",
+				batch.minimumFormatMajorVersion, fmv,
+			))
+		}
+	}
+
 	if batch.countRangeKeys > 0 {
 		if d.split == nil {
 			return errNoSplit
 		}
-		if d.FormatMajorVersion() < FormatRangeKeys {
-			panic(fmt.Sprintf(
-				"pebble: range keys require at least format major version %d (current: %d)",
-				FormatRangeKeys, d.FormatMajorVersion(),
-			))
-		}
-
 		// TODO(jackson): Assert that all range key operands are suffixless.
 	}
 
@@ -1320,6 +1362,7 @@ func (i *Iterator) constructPointIter(
 	levelsIndex := len(levels)
 	mlevels = mlevels[:numMergingLevels]
 	levels = levels[:numLevelIters]
+	i.opts.snapshotForHideObsoletePoints = buf.dbi.seqNum
 	addLevelIterForFiles := func(files manifest.LevelIterator, level manifest.Level) {
 		li := &levels[levelsIndex]
 
@@ -1523,6 +1566,16 @@ func (d *DB) Close() error {
 	d.mu.Unlock()
 	d.deleters.Wait()
 	d.compactionSchedulers.Wait()
+
+	// Sanity check metrics.
+	if invariants.Enabled {
+		m := d.Metrics()
+		if m.Compact.NumInProgress > 0 || m.Compact.InProgressBytes > 0 {
+			d.mu.Lock()
+			panic(fmt.Sprintf("invalid metrics on close:\n%s", m))
+		}
+	}
+
 	d.mu.Lock()
 
 	// As a sanity check, ensure that there are no zombie tables. A non-zero count
@@ -1823,6 +1876,10 @@ func (d *DB) Metrics() *Metrics {
 type sstablesOptions struct {
 	// set to true will return the sstable properties in TableInfo
 	withProperties bool
+
+	// if set, return sstables that overlap the key range (end-exclusive)
+	start []byte
+	end   []byte
 }
 
 // SSTablesOption set optional parameter used by `DB.SSTables`.
@@ -1835,6 +1892,15 @@ type SSTablesOption func(*sstablesOptions)
 func WithProperties() SSTablesOption {
 	return func(opt *sstablesOptions) {
 		opt.withProperties = true
+	}
+}
+
+// WithKeyRangeFilter ensures returned sstables overlap start and end (end-exclusive)
+// if start and end are both nil these properties have no effect
+func WithKeyRangeFilter(start, end []byte) SSTablesOption {
+	return func(opt *sstablesOptions) {
+		opt.end = end
+		opt.start = start
 	}
 }
 
@@ -1883,6 +1949,9 @@ func (d *DB) SSTables(opts ...SSTablesOption) ([][]SSTableInfo, error) {
 		iter := srcLevels[i].Iter()
 		j := 0
 		for m := iter.First(); m != nil; m = iter.Next() {
+			if opt.start != nil && opt.end != nil && !m.Overlaps(d.opts.Comparer.Compare, opt.start, opt.end, true /* exclusive end */) {
+				continue
+			}
 			destTables[j] = SSTableInfo{TableInfo: m.TableInfo()}
 			if opt.withProperties {
 				p, err := d.tableCache.getTableProperties(
@@ -1900,6 +1969,7 @@ func (d *DB) SSTables(opts ...SSTablesOption) ([][]SSTableInfo, error) {
 		destLevels[i] = destTables[:j]
 		destTables = destTables[j:]
 	}
+
 	return destLevels, nil
 }
 

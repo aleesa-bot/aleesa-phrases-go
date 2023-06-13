@@ -24,6 +24,14 @@ const (
 	//InternalKeyKindColumnFamilyDeletion     InternalKeyKind = 4
 	//InternalKeyKindColumnFamilyValue        InternalKeyKind = 5
 	//InternalKeyKindColumnFamilyMerge        InternalKeyKind = 6
+
+	// InternalKeyKindSingleDelete (SINGLEDEL) is a performance optimization
+	// solely for compactions (to reduce write amp and space amp). Readers other
+	// than compactions should treat SINGLEDEL as equivalent to a DEL.
+	// Historically, it was simpler for readers other than compactions to treat
+	// SINGLEDEL as equivalent to DEL, but as of the introduction of
+	// InternalKeyKindSSTableInternalObsoleteBit, this is also necessary for
+	// correctness.
 	InternalKeyKindSingleDelete InternalKeyKind = 7
 	//InternalKeyKindColumnFamilySingleDelete InternalKeyKind = 8
 	//InternalKeyKindBeginPrepareXID          InternalKeyKind = 9
@@ -66,8 +74,15 @@ const (
 	// batch, or in an sstable.
 	InternalKeyKindIngestSST InternalKeyKind = 22
 
-	// This maximum value isn't part of the file format. It's unlikely,
-	// but future extensions may increase this value.
+	// InternalKeyKindDeleteSized keys behave identically to
+	// InternalKeyKindDelete keys, except that they hold an associated uint64
+	// value indicating the (len(key)+len(value)) of the shadowed entry the
+	// tombstone is expected to delete. This value is used to inform compaction
+	// heuristics, but is not required to be accurate for correctness.
+	InternalKeyKindDeleteSized InternalKeyKind = 23
+
+	// This maximum value isn't part of the file format. Future extensions may
+	// increase this value.
 	//
 	// When constructing an internal key to pass to DB.Seek{GE,LE},
 	// internalKeyComparer sorts decreasing by kind (after sorting increasing by
@@ -75,14 +90,19 @@ const (
 	// which sorts 'less than or equal to' any other valid internalKeyKind, when
 	// searching for any kind of internal key formed by a certain user key and
 	// seqNum.
-	InternalKeyKindMax InternalKeyKind = 22
+	InternalKeyKindMax InternalKeyKind = 23
+
+	// Internal to the sstable format. Not exposed by any sstable iterator.
+	// Declared here to prevent definition of valid key kinds that set this bit.
+	InternalKeyKindSSTableInternalObsoleteBit  InternalKeyKind = 64
+	InternalKeyKindSSTableInternalObsoleteMask InternalKeyKind = 191
 
 	// InternalKeyZeroSeqnumMaxTrailer is the largest trailer with a
 	// zero sequence number.
-	InternalKeyZeroSeqnumMaxTrailer = uint64(InternalKeyKindInvalid)
+	InternalKeyZeroSeqnumMaxTrailer = uint64(255)
 
 	// A marker for an invalid key.
-	InternalKeyKindInvalid InternalKeyKind = 255
+	InternalKeyKindInvalid InternalKeyKind = InternalKeyKindSSTableInternalObsoleteMask
 
 	// InternalKeySeqNumBatch is a bit that is set on batch sequence numbers
 	// which prevents those entries from being excluded from iteration.
@@ -105,6 +125,9 @@ const (
 	InternalKeyBoundaryRangeKey = (InternalKeySeqNumMax << 8) | uint64(InternalKeyKindRangeKeySet)
 )
 
+// Assert InternalKeyKindSSTableInternalObsoleteBit > InternalKeyKindMax
+const _ = uint(InternalKeyKindSSTableInternalObsoleteBit - InternalKeyKindMax - 1)
+
 var internalKeyKindNames = []string{
 	InternalKeyKindDelete:         "DEL",
 	InternalKeyKindSet:            "SET",
@@ -118,6 +141,7 @@ var internalKeyKindNames = []string{
 	InternalKeyKindRangeKeyUnset:  "RANGEKEYUNSET",
 	InternalKeyKindRangeKeyDelete: "RANGEKEYDEL",
 	InternalKeyKindIngestSST:      "INGESTSST",
+	InternalKeyKindDeleteSized:    "DELSIZED",
 	InternalKeyKindInvalid:        "INVALID",
 }
 
@@ -204,6 +228,7 @@ var kindsMap = map[string]InternalKeyKind{
 	"RANGEKEYUNSET": InternalKeyKindRangeKeyUnset,
 	"RANGEKEYDEL":   InternalKeyKindRangeKeyDelete,
 	"INGESTSST":     InternalKeyKindIngestSST,
+	"DELSIZED":      InternalKeyKindDeleteSized,
 }
 
 // ParseInternalKey parses the string representation of an internal key. The
