@@ -25,8 +25,9 @@ const (
 	TableFormatPebblev2 // Range keys.
 	TableFormatPebblev3 // Value blocks.
 	TableFormatPebblev4 // DELSIZED tombstones.
+	NumTableFormats
 
-	TableFormatMax = TableFormatPebblev4
+	TableFormatMax = NumTableFormats - 1
 )
 
 // TableFormatPebblev4, in addition to DELSIZED, introduces the use of
@@ -91,7 +92,8 @@ const (
 // obsolete, i.e., obsolete within the sstable, and we can guarantee that at
 // most one point will be exposed per user key. MERGE keys create more
 // complexity: MERGE followed by MERGE causes multiple keys to not be
-// obsolete. Same applies for MERGE followed by SET/SETWITHDEL. Note that:
+// obsolete. Same applies for MERGE followed by SET/SETWITHDEL/DEL*. Note
+// that:
 //
 // - For regular sst iteration, the obsolete marking is a performance
 //   optimization, and multiple keys for the same userkey can be handled by

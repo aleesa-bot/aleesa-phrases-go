@@ -14,12 +14,15 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/fifo"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/humanize"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
-	"github.com/cockroachdb/pebble/objstorage/shared"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/objstorage/remote"
+	"github.com/cockroachdb/pebble/rangekey"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -118,6 +121,16 @@ type IterOptions struct {
 	// false to skip scanning. This function must be thread-safe since the same
 	// function can be used by multiple iterators, if the iterator is cloned.
 	TableFilter func(userProps map[string]string) bool
+	// SkipPoint may be used to skip over point keys that don't match an
+	// arbitrary predicate during iteration. If set, the Iterator invokes
+	// SkipPoint for keys encountered. If SkipPoint returns true, the iterator
+	// will skip the key without yielding it to the iterator operation in
+	// progress.
+	//
+	// SkipPoint must be a pure function and always return the same result when
+	// provided the same arguments. The iterator may call SkipPoint multiple
+	// times for the same user key.
+	SkipPoint func(userKey []byte) bool
 	// PointKeyFilters can be used to avoid scanning tables and blocks in tables
 	// when iterating over point keys. This slice represents an intersection
 	// across all filters, i.e., all filters must indicate that the block is
@@ -231,13 +244,12 @@ func (o *IterOptions) getLogger() Logger {
 }
 
 // SpanIterOptions creates a SpanIterOptions from this IterOptions.
-func (o *IterOptions) SpanIterOptions(level manifest.Level) keyspan.SpanIterOptions {
+func (o *IterOptions) SpanIterOptions() keyspan.SpanIterOptions {
 	if o == nil {
-		return keyspan.SpanIterOptions{Level: level}
+		return keyspan.SpanIterOptions{}
 	}
 	return keyspan.SpanIterOptions{
 		RangeKeyFilters: o.RangeKeyFilters,
-		Level:           level,
 	}
 }
 
@@ -246,9 +258,21 @@ func (o *IterOptions) SpanIterOptions(level manifest.Level) keyspan.SpanIterOpti
 type scanInternalOptions struct {
 	IterOptions
 
+	visitPointKey   func(key *InternalKey, value LazyValue, iterInfo IteratorLevel) error
+	visitRangeDel   func(start, end []byte, seqNum uint64) error
+	visitRangeKey   func(start, end []byte, keys []rangekey.Key) error
+	visitSharedFile func(sst *SharedSSTMeta) error
+
 	// skipSharedLevels skips levels that are shareable (level >=
 	// sharedLevelStart).
 	skipSharedLevels bool
+
+	// includeObsoleteKeys specifies whether keys shadowed by newer internal keys
+	// are exposed. If false, only one internal key per user key is exposed.
+	includeObsoleteKeys bool
+
+	// rateLimitFunc is used to limit the amount of bytes read per second.
+	rateLimitFunc func(key *InternalKey, value LazyValue) error
 }
 
 // RangeKeyMasking configures automatic hiding of point keys by range keys. A
@@ -459,10 +483,24 @@ type Options struct {
 	// The default cache size is 8 MB.
 	Cache *cache.Cache
 
+	// LoadBlockSema, if set, is used to limit the number of blocks that can be
+	// loaded (i.e. read from the filesystem) in parallel. Each load acquires one
+	// unit from the semaphore for the duration of the read.
+	LoadBlockSema *fifo.Semaphore
+
 	// Cleaner cleans obsolete files.
 	//
 	// The default cleaner uses the DeleteCleaner.
 	Cleaner Cleaner
+
+	// Local contains option that pertain to files stored on the local filesystem.
+	Local struct {
+		// ReadaheadConfigFn is a function used to retrieve the current readahead
+		// mode. This function is consulted when a table enters the table cache.
+		ReadaheadConfigFn func() ReadaheadConfig
+
+		// TODO(radu): move BytesPerSync, LoadBlockSema, Cleaner here.
+	}
 
 	// Comparer defines a total ordering over the space of []byte keys: a 'less
 	// than' relationship. The same comparison algorithm must be used for reads
@@ -526,7 +564,12 @@ type Options struct {
 		// concurrent compaction is added. This works "on top" of
 		// L0CompactionConcurrency, so the higher of the count of compaction
 		// concurrency slots as determined by the two options is chosen.
-		CompactionDebtConcurrency int
+		CompactionDebtConcurrency uint64
+
+		// IngestSplit, if it returns true, allows for ingest-time splitting of
+		// existing sstables into two virtual sstables to allow ingestion sstables to
+		// slot into a lower level than they otherwise would have.
+		IngestSplit func() bool
 
 		// ReadCompactionRate controls the frequency of read triggered
 		// compactions by adjusting `AllowedSeeks` in manifest.FileMetadata:
@@ -591,10 +634,10 @@ type Options struct {
 		// desired size of each level of the LSM. Defaults to 10.
 		LevelMultiplier int
 
-		// MultiLevelCompactionHueristic determines whether to add an additional
+		// MultiLevelCompactionHeuristic determines whether to add an additional
 		// level to a conventional two level compaction. If nil, a multilevel
 		// compaction will never get triggered.
-		MultiLevelCompactionHueristic MultiLevelHeuristic
+		MultiLevelCompactionHeuristic MultiLevelHeuristic
 
 		// MaxWriterConcurrency is used to indicate the maximum number of
 		// compression workers the compression queue is allowed to use. If
@@ -653,15 +696,49 @@ type Options struct {
 		// major version is at least `FormatFlushableIngest`.
 		DisableIngestAsFlushable func() bool
 
-		// SharedStorage is a second FS-like storage medium that can be shared
-		// between multiple Pebble instances. It is used to store sstables only, and
-		// is managed by objstorage.Provider. Each sstable might only be written to
-		// by one Pebble instance, but other Pebble instances can possibly read the
-		// same files if they have the path to get to them. The pebble instance that
-		// wrote a file should not delete it if other Pebble instances are known to
-		// be reading this file. This FS is expected to have slower read/write
-		// performance than the default FS above.
-		SharedStorage shared.Storage
+		// RemoteStorage enables use of remote storage (e.g. S3) for storing
+		// sstables. Setting this option enables use of CreateOnShared option and
+		// allows ingestion of external files.
+		RemoteStorage remote.StorageFactory
+
+		// If CreateOnShared is non-zero, new sstables are created on remote storage
+		// (using CreateOnSharedLocator and with the appropriate
+		// CreateOnSharedStrategy). These sstables can be shared between different
+		// Pebble instances; the lifecycle of such objects is managed by the
+		// remote.Storage constructed by options.RemoteStorage.
+		//
+		// Can only be used when RemoteStorage is set (and recognizes
+		// CreateOnSharedLocator).
+		CreateOnShared        remote.CreateOnSharedStrategy
+		CreateOnSharedLocator remote.Locator
+
+		// CacheSizeBytesBytes is the size of the on-disk block cache for objects
+		// on shared storage in bytes. If it is 0, no cache is used.
+		SecondaryCacheSizeBytes int64
+
+		// IneffectualPointDeleteCallback is called in compactions/flushes if any
+		// single delete is being elided without deleting a point set/merge.
+		IneffectualSingleDeleteCallback func(userKey []byte)
+
+		// SingleDeleteInvariantViolationCallback is called in compactions/flushes if any
+		// single delete has consumed a Set/Merge, and there is another immediately older
+		// Set/SetWithDelete/Merge. The user of Pebble has violated the invariant under
+		// which SingleDelete can be used correctly.
+		//
+		// Consider the sequence SingleDelete#3, Set#2, Set#1. There are three
+		// ways some of these keys can first meet in a compaction.
+		//
+		// - All 3 keys in the same compaction: this callback will detect the
+		//   violation.
+		//
+		// - SingleDelete#3, Set#2 meet in a compaction first: Both keys will
+		//   disappear. The violation will not be detected, and the DB will have
+		//   Set#1 which is likely incorrect (from the user's perspective).
+		//
+		// - Set#2, Set#1 meet in a compaction first: The output will be Set#2,
+		//   which will later be consumed by SingleDelete#3. The violation will
+		//   not be detected and the DB will be correct.
+		SingleDeleteInvariantViolationCallback func(userKey []byte)
 	}
 
 	// Filters is a map from filter policy name to filter policy. It is used for
@@ -776,12 +853,18 @@ type Options struct {
 	// writing the contents of the old one in the
 	// background. MemTableStopWritesThreshold places a hard limit on the size of
 	// the queued MemTables.
-	MemTableSize int
+	//
+	// The default value is 4MB.
+	MemTableSize uint64
 
-	// Hard limit on the size of queued of MemTables. Writes are stopped when the
-	// sum of the queued memtable sizes exceeds
-	// MemTableStopWritesThreshold*MemTableSize. This value should be at least 2
-	// or writes will stop whenever a MemTable is being flushed.
+	// Hard limit on the number of queued of MemTables. Writes are stopped when
+	// the sum of the queued memtable sizes exceeds:
+	//   MemTableStopWritesThreshold * MemTableSize.
+	//
+	// This value should be at least 2 or writes will stop whenever a MemTable is
+	// being flushed.
+	//
+	// The default value is 2.
 	MemTableStopWritesThreshold int
 
 	// Merger defines the associative merge operation to use for merging values
@@ -872,9 +955,10 @@ type Options struct {
 	// Deletion pacing is used to slow down deletions when compactions finish up
 	// or readers close and newly-obsolete files need cleaning up. Deleting lots
 	// of files at once can cause disk latency to go up on some SSDs, which this
-	// functionality guards against. This is only a best-effort target; pacing is
-	// disabled when there are too many obsolete files relative to live bytes, or
-	// there isn't enough disk space available.
+	// functionality guards against.
+	//
+	// This value is only a best-effort target; the effective rate can be
+	// higher if deletions are falling behind or disk space is running low.
 	//
 	// Setting this to 0 disables deletion pacing, which is also the default.
 	TargetByteDeletionRate int
@@ -912,6 +996,10 @@ type Options struct {
 		// A private option to disable stats collection.
 		disableTableStats bool
 
+		// testingAlwaysWaitForCleanup is set by some tests to force waiting for
+		// obsolete file deletion (to make events deterministic).
+		testingAlwaysWaitForCleanup bool
+
 		// fsCloser holds a closer that should be invoked after a DB using these
 		// Options is closed. This is used to automatically stop the
 		// long-running goroutine associated with the disk-health-checking FS.
@@ -923,6 +1011,9 @@ type Options struct {
 		fsCloser io.Closer
 	}
 }
+
+// ReadaheadConfig controls the use of read-ahead.
+type ReadaheadConfig = objstorageprovider.ReadaheadConfig
 
 // DebugCheckLevels calls CheckLevels on the provided database.
 // It may be set in the DebugCheck field of Options to check
@@ -1023,7 +1114,7 @@ func (o *Options) EnsureDefaults() *Options {
 		o.MaxOpenFiles = 1000
 	}
 	if o.MemTableSize <= 0 {
-		o.MemTableSize = 4 << 20
+		o.MemTableSize = 4 << 20 // 4 MB
 	}
 	if o.MemTableStopWritesThreshold <= 0 {
 		o.MemTableStopWritesThreshold = 2
@@ -1064,8 +1155,8 @@ func (o *Options) EnsureDefaults() *Options {
 	if o.Experimental.CPUWorkPermissionGranter == nil {
 		o.Experimental.CPUWorkPermissionGranter = defaultCPUWorkGranter{}
 	}
-	if o.Experimental.MultiLevelCompactionHueristic == nil {
-		o.Experimental.MultiLevelCompactionHueristic = NoMultiLevel{}
+	if o.Experimental.MultiLevelCompactionHeuristic == nil {
+		o.Experimental.MultiLevelCompactionHeuristic = WriteAmpHeuristic{}
 	}
 
 	o.initMaps()
@@ -1205,6 +1296,8 @@ func (o *Options) String() string {
 	fmt.Fprintf(&buf, "  wal_bytes_per_sync=%d\n", o.WALBytesPerSync)
 	fmt.Fprintf(&buf, "  max_writer_concurrency=%d\n", o.Experimental.MaxWriterConcurrency)
 	fmt.Fprintf(&buf, "  force_writer_parallelism=%t\n", o.Experimental.ForceWriterParallelism)
+	fmt.Fprintf(&buf, "  secondary_cache_size_bytes=%d\n", o.Experimental.SecondaryCacheSizeBytes)
+	fmt.Fprintf(&buf, "  create_on_shared=%d\n", o.Experimental.CreateOnShared)
 
 	// Private options.
 	//
@@ -1260,7 +1353,11 @@ func parseOptions(s string, fn func(section, key, value string) error) error {
 
 		pos := strings.Index(line, "=")
 		if pos < 0 {
-			return errors.Errorf("pebble: invalid key=value syntax: %s", errors.Safe(line))
+			const maxLen = 50
+			if len(line) > maxLen {
+				line = line[:maxLen-3] + "..."
+			}
+			return base.CorruptionErrorf("invalid key=value syntax: %q", errors.Safe(line))
 		}
 
 		key := strings.TrimSpace(line[:pos])
@@ -1358,7 +1455,7 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 					}
 				}
 			case "compaction_debt_concurrency":
-				o.Experimental.CompactionDebtConcurrency, err = strconv.Atoi(value)
+				o.Experimental.CompactionDebtConcurrency, err = strconv.ParseUint(value, 10, 64)
 			case "delete_range_flush_delay":
 				// NB: This is a deprecated serialization of the
 				// `flush_delay_delete_range`.
@@ -1423,7 +1520,7 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 			case "max_open_files":
 				o.MaxOpenFiles, err = strconv.Atoi(value)
 			case "mem_table_size":
-				o.MemTableSize, err = strconv.Atoi(value)
+				o.MemTableSize, err = strconv.ParseUint(value, 10, 64)
 			case "mem_table_stop_writes_threshold":
 				o.MemTableStopWritesThreshold, err = strconv.Atoi(value)
 			case "min_compaction_rate":
@@ -1474,6 +1571,12 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 				o.Experimental.MaxWriterConcurrency, err = strconv.Atoi(value)
 			case "force_writer_parallelism":
 				o.Experimental.ForceWriterParallelism, err = strconv.ParseBool(value)
+			case "secondary_cache_size_bytes":
+				o.Experimental.SecondaryCacheSizeBytes, err = strconv.ParseInt(value, 10, 64)
+			case "create_on_shared":
+				var createOnSharedInt int64
+				createOnSharedInt, err = strconv.ParseInt(value, 10, 64)
+				o.Experimental.CreateOnShared = remote.CreateOnSharedStrategy(createOnSharedInt)
 			default:
 				if hooks != nil && hooks.SkipUnknown != nil && hooks.SkipUnknown(section+"."+key, value) {
 					return nil
@@ -1604,7 +1707,7 @@ func (o *Options) Validate() error {
 	}
 	if uint64(o.MemTableSize) >= maxMemTableSize {
 		fmt.Fprintf(&buf, "MemTableSize (%s) must be < %s\n",
-			humanize.Uint64(uint64(o.MemTableSize)), humanize.Uint64(maxMemTableSize))
+			humanize.Bytes.Uint64(uint64(o.MemTableSize)), humanize.Bytes.Uint64(maxMemTableSize))
 	}
 	if o.MemTableStopWritesThreshold < 2 {
 		fmt.Fprintf(&buf, "MemTableStopWritesThreshold (%d) must be >= 2\n",
@@ -1629,6 +1732,7 @@ func (o *Options) MakeReaderOptions() sstable.ReaderOptions {
 	var readerOpts sstable.ReaderOptions
 	if o != nil {
 		readerOpts.Cache = o.Cache
+		readerOpts.LoadBlockSema = o.LoadBlockSema
 		readerOpts.Comparer = o.Comparer
 		readerOpts.Filters = o.Filters
 		if o.Merger != nil {
