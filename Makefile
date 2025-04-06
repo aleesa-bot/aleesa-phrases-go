@@ -1,22 +1,22 @@
 #!/usr/bin/env gmake -f
 
 GOOPTS=CGO_ENABLED=0
-BUILDOPTS=-ldflags="-s -w" -a -gcflags=all=-l -trimpath
+BUILDOPTS=-ldflags="-s -w" -a -gcflags=all=-l -trimpath -buildvcs=false
 
 all: clean build
 
 build:
-	${GOOPTS} go build ${BUILDOPTS} -o seed-fortune      aleesa-phrases-lib.go seed-fortune.go
-	${GOOPTS} go build ${BUILDOPTS} -o seed-proverb      aleesa-phrases-lib.go seed-proverb.go
-	${GOOPTS} go build ${BUILDOPTS} -o seed-friday       aleesa-phrases-lib.go seed-friday.go
-	${GOOPTS} go build ${BUILDOPTS} -o aleesa-phrases-go aleesa-phrases-lib.go aleesa-phrases.go
+	${GOOPTS} go build ${BUILDOPTS} -o seed-fortune      ./cmd/seed-fortune
+	${GOOPTS} go build ${BUILDOPTS} -o seed-proverb      ./cmd/seed-proverb
+	${GOOPTS} go build ${BUILDOPTS} -o seed-friday       ./cmd/seed-friday
+	${GOOPTS} go build ${BUILDOPTS} -o aleesa-phrases-go ./cmd/aleesa-phrases-go
 
 clean:
-	go clean
+	rm -rf seed-{fortune,proverb,friday} aleesa-phrases-go
 
 upgrade:
 	rm -rf vendor
-	go get -d -u -t ./...
+	go get -u -t -tool ./...
 	go mod tidy
 	go mod vendor
 
