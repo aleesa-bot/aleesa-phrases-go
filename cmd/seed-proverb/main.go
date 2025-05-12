@@ -37,9 +37,8 @@ func main() {
 	// Откроем все наши БД
 	var options pebble.Options
 	// По дефолту ограничение ставится на мегабайты данных, а не на количество файлов, поэтому с дефолтными настройками
-	// порождается огромное количество файлов. Умолчальное ограничение на количество файлов - 500 штук, что нас не
-	// устраивает, поэтому немного снизим эту цифру до более приемлемых значений
-	options.L0CompactionFileThreshold = 8
+	// порождается огромное количество файлов. Умолчальное ограничение на количество файлов - 500 штук.
+	options.L0CompactionFileThreshold = 300
 
 	lib.PebbleDB.Proverb.Name = "proverb_db"
 	lib.PebbleDB.Proverb.DB, err = pebble.Open(lib.Config.DataDir+"/"+lib.PebbleDB.Proverb.Name, &options)

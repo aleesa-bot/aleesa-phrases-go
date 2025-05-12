@@ -29,9 +29,8 @@ func changeKarma(chatID string, phrase string, action string) string {
 	if _, ok := KarmaDB[database]; !ok {
 		var options pebble.Options
 		// По дефолту ограничение ставится на мегабайты данных, а не на количество файлов, поэтому с дефолтными
-		// настройками порождается огромное количество файлов. Умолчальное ограничение на количество файлов - 500 штук,
-		// что нас не устраивает, поэтому немного снизим эту цифру до более приемлемых значений
-		options.L0CompactionFileThreshold = 8
+		// настройками порождается огромное количество файлов. Умолчальное ограничение на количество файлов - 500 штук.
+		options.L0CompactionFileThreshold = 300
 
 		KarmaDB[database], err = pebble.Open(Config.DataDir+"/"+database, &options)
 
@@ -124,9 +123,8 @@ func getKarma(chatID string, phrase string) string {
 	if _, ok := KarmaDB[database]; !ok {
 		var options pebble.Options
 		// По дефолту ограничение ставится на мегабайты данных, а не на количество файлов, поэтому с дефолтными
-		// настройками порождается огромное количество файлов. Умолчальное ограничение на количество файлов - 500 штук,
-		// что нас не устраивает, поэтому немного снизим эту цифру до более приемлемых значений
-		options.L0CompactionFileThreshold = 8
+		// настройками порождается огромное количество файлов. Умолчальное ограничение на количество файлов - 500 штук.
+		options.L0CompactionFileThreshold = 300
 		KarmaDB[database], err = pebble.Open(Config.DataDir+"/"+database, &options)
 
 		if err != nil {
